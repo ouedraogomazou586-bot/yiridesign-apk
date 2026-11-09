@@ -1,0 +1,231 @@
+name: Fabriquer l'APK YiriDesign
+
+# Se lance à la main : onglet « Actions » > « Fabriquer l'APK YiriDesign » > « Run workflow ».
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: YiriDesign
+  APP_ID: bf.yiridesign.app
+  APP_PATH: /yiridesign/
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Composants Android
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      - name: Clé de signature (créée une seule fois, puis réutilisée)
+        env:
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::Le secret KEY_PASSWORD est absent. Dépôt > Settings > Secrets and variables > Actions > New repository secret, nom : KEY_PASSWORD, valeur : un long mot de passe (16 caractères ou plus)."
+            exit 1
+          fi
+          KS="$RUNNER_TEMP/yiridesign.keystore"
+          if [ -f signing/yiridesign.keystore.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in signing/yiridesign.keystore.enc -out "$KS" -pass env:KEY_PASSWORD \
+              || { echo "::error::Mot de passe incorrect : KEY_PASSWORD ne correspond pas à la clé enregistrée."; exit 1; }
+          else
+            keytool -genkeypair -keystore "$KS" -alias yiridesign -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$KEY_PASSWORD" -keypass "$KEY_PASSWORD" -dname "CN=YiriDesign, O=YiriDesign, C=BF"
+            mkdir -p signing
+            openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -in "$KS" -out signing/yiridesign.keystore.enc -pass env:KEY_PASSWORD
+            git config user.name "github-actions"
+            git config user.email "actions@users.noreply.github.com"
+            git add signing/yiridesign.keystore.enc
+            git commit -m "Clé de signature de l'application (chiffrée)"
+            git push origin HEAD
+          fi
+          echo "KS_PATH=$KS" >> "$GITHUB_ENV"
+
+      - name: Fabriquer le projet Android
+        env:
+          OWNER: ${{ github.repository_owner }}
+          RUN_NO: ${{ github.run_number }}
+        run: |
+          HOST="${OWNER,,}.github.io"
+          APP_URL="https://$HOST${APP_PATH}"
+          echo "Adresse de l'application : $APP_URL"
+          curl -fsSL "${APP_URL}ic512.png" -o icon.png || { echo "::error::Impossible de lire ${APP_URL}ic512.png : l'application doit être en ligne sur GitHub Pages."; exit 1; }
+          command -v convert >/dev/null || sudo apt-get install -y imagemagick >/dev/null
+          mkdir -p twa/app/src/main/res/values twa/app/src/main/res/mipmap-mdpi twa/app/src/main/res/mipmap-hdpi twa/app/src/main/res/mipmap-xhdpi twa/app/src/main/res/mipmap-xxhdpi twa/app/src/main/res/mipmap-xxxhdpi
+          for s in "mdpi 48" "hdpi 72" "xhdpi 96" "xxhdpi 144" "xxxhdpi 192"; do
+            set -- $s
+            convert icon.png -resize "${2}x${2}" "twa/app/src/main/res/mipmap-$1/ic_launcher.png"
+          done
+          cd twa
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "YiriDesign"
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'bf.yiridesign.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'bf.yiridesign.app'
+                  minSdk 21
+                  targetSdk 34
+                  versionCode Integer.parseInt(System.getenv('RUN_NO'))
+                  versionName '1.0.' + System.getenv('RUN_NO')
+              }
+              signingConfigs {
+                  release {
+                      storeFile file(System.getenv('KS_PATH'))
+                      storePassword System.getenv('KEY_PASSWORD')
+                      keyAlias 'yiridesign'
+                      keyPassword System.getenv('KEY_PASSWORD')
+                  }
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.release
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+              lint {
+                  checkReleaseBuilds false
+                  abortOnError false
+              }
+          }
+          dependencies {
+              implementation 'com.google.androidbrowserhelper:androidbrowserhelper:2.5.0'
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="YiriDesign"
+                  android:supportsRtl="true">
+                  <meta-data
+                      android:name="asset_statements"
+                      android:resource="@string/asset_statements" />
+                  <activity
+                      android:name="com.google.androidbrowserhelper.trusted.LauncherActivity"
+                      android:alwaysRetainTaskState="true"
+                      android:exported="true"
+                      android:label="YiriDesign"
+                      android:theme="@android:style/Theme.Translucent.NoTitleBar">
+                      <meta-data
+                          android:name="android.support.customtabs.trusted.DEFAULT_URL"
+                          android:value="__APP_URL__" />
+                      <meta-data
+                          android:name="android.support.customtabs.trusted.STATUS_BAR_COLOR"
+                          android:resource="@color/primary" />
+                      <meta-data
+                          android:name="android.support.customtabs.trusted.NAVIGATION_BAR_COLOR"
+                          android:resource="@color/primary" />
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter android:autoVerify="true">
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.BROWSABLE" />
+                          <data android:scheme="https" android:host="__HOST__" android:pathPrefix="__PATH__" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/values/colors.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="primary">#0F766E</color>
+          </resources>
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="asset_statements">[{\"relation\": [\"delegate_permission/common.handle_all_urls\"], \"target\": {\"namespace\": \"web\", \"site\": \"https://__HOST__\"}}]</string>
+          </resources>
+          EOF
+          sed -i "s#__APP_URL__#$APP_URL#g; s#__HOST__#$HOST#g; s#__PATH__#${APP_PATH%/}#g" app/src/main/AndroidManifest.xml app/src/main/res/values/strings.xml
+
+      - name: Compiler l'APK et le paquet Play Store
+        working-directory: twa
+        env:
+          RUN_NO: ${{ github.run_number }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: gradle --no-daemon assembleRelease bundleRelease
+
+      - name: Publier
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          OWNER: ${{ github.repository_owner }}
+          RUN_NO: ${{ github.run_number }}
+        run: |
+          HOST="${OWNER,,}.github.io"
+          cp twa/app/build/outputs/apk/release/app-release.apk YiriDesign.apk
+          cp twa/app/build/outputs/bundle/release/app-release.aab YiriDesign.aab
+          FP=$(keytool -list -v -keystore "$KS_PATH" -alias yiridesign -storepass "$KEY_PASSWORD" | grep "SHA256:" | head -1 | sed 's/.*SHA256: *//')
+          {
+            echo "Application YiriDesign, version 1.0.$RUN_NO."
+            echo
+            echo "Empreinte de la clé de signature (SHA-256) :"
+            echo
+            echo "$FP"
+            echo
+            echo "Fichier assetlinks.json (pour retirer la barre d'adresse), à placer dans le dépôt $OWNER.github.io, dossier .well-known :"
+            echo
+            echo '```json'
+            echo "[{\"relation\":[\"delegate_permission/common.handle_all_urls\"],\"target\":{\"namespace\":\"android_app\",\"package_name\":\"$APP_ID\",\"sha256_cert_fingerprints\":[\"$FP\"]}}]"
+            echo '```'
+          } > notes.md
+          gh release create "v1.0.$RUN_NO" YiriDesign.apk YiriDesign.aab --title "YiriDesign 1.0.$RUN_NO" --notes-file notes.md
